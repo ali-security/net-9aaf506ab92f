@@ -206,6 +206,133 @@ func TestRenderTextNodes(t *testing.T) {
 	}
 }
 
+// containsElement reports whether the tree rooted at n contains an element
+// with the given tag name.
+func containsElement(n *Node, data string) bool {
+	if n.Type == ElementNode && n.Data == data {
+		return true
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if containsElement(c, data) {
+			return true
+		}
+	}
+	return false
+}
+
+// doctypeIdentifiers returns the public and system identifiers of the first
+// doctype node in the tree rooted at n.
+func doctypeIdentifiers(n *Node) (public, system string, found bool) {
+	if n.Type == DoctypeNode {
+		for _, a := range n.Attr {
+			switch a.Key {
+			case "public":
+				public = a.Val
+			case "system":
+				system = a.Val
+			}
+		}
+		return public, system, true
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if public, system, found = doctypeIdentifiers(c); found {
+			return public, system, true
+		}
+	}
+	return "", "", false
+}
+
+// TestRenderDoctypeIdentifiers checks that a '>' inside a doctype PUBLIC or
+// SYSTEM identifier is escaped as "&gt;" when rendering. Without the escaping,
+// re-parsing the output terminates the doctype early (an
+// abrupt-doctype-system-identifier parse error), which emits the rest of the
+// identifier in the data state and smuggles markup into the tree. Sanitizers
+// that inspect the parsed tree and then Render it can be bypassed this way.
+func TestRenderDoctypeIdentifiers(t *testing.T) {
+	tests := []struct {
+		public, system string
+		want           string
+	}{
+		{
+			system: `><script>alert(1)</script>`,
+			want:   `<!DOCTYPE html SYSTEM "&gt;<script&gt;alert(1)</script&gt;">`,
+		},
+		{
+			public: `><script>alert(1)</script>`,
+			want:   `<!DOCTYPE html PUBLIC "&gt;<script&gt;alert(1)</script&gt;">`,
+		},
+		{
+			public: ">",
+			system: ">",
+			want:   `<!DOCTYPE html PUBLIC "&gt;" "&gt;">`,
+		},
+		{
+			// A double quote in the identifier makes the renderer
+			// delimit it with single quotes; '>' must still be escaped.
+			system: `"><script>alert(1)</script>`,
+			want:   `<!DOCTYPE html SYSTEM '"&gt;<script&gt;alert(1)</script&gt;'>`,
+		},
+	}
+	for _, test := range tests {
+		var attr []Attribute
+		if test.public != "" {
+			attr = append(attr, Attribute{Key: "public", Val: test.public})
+		}
+		if test.system != "" {
+			attr = append(attr, Attribute{Key: "system", Val: test.system})
+		}
+		doc := &Node{Type: DocumentNode}
+		doc.AppendChild(&Node{Type: DoctypeNode, Data: "html", Attr: attr})
+
+		buf := new(bytes.Buffer)
+		if err := Render(buf, doc); err != nil {
+			t.Errorf("Render(%v): %v", attr, err)
+			continue
+		}
+		if got := buf.String(); got != test.want {
+			t.Errorf("Render(%v):\ngot  %q\nwant %q", attr, got, test.want)
+		}
+
+		// Re-parsing the rendered doctype must recover the identifiers
+		// unchanged, and must not turn any of their contents into markup.
+		doc1, err := Parse(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Errorf("Parse(%q): %v", buf.String(), err)
+			continue
+		}
+		public, system, found := doctypeIdentifiers(doc1)
+		if !found {
+			t.Errorf("Parse(%q): no doctype node in the re-parsed tree", buf.String())
+			continue
+		}
+		if public != test.public || system != test.system {
+			t.Errorf("re-parsed %q: got public=%q system=%q, want public=%q system=%q",
+				buf.String(), public, system, test.public, test.system)
+		}
+		if containsElement(doc1, "script") {
+			t.Errorf("re-parsing %q produced a <script> element", buf.String())
+		}
+	}
+}
+
+// TestRenderDoctypeBothQuoteTypes checks that a doctype identifier holding both
+// quote types is rejected. parseDoctype never produces such a node, but a
+// caller can construct one, and there is no way to delimit it without the
+// closing quote landing inside the identifier and changing the re-parsed tree.
+func TestRenderDoctypeBothQuoteTypes(t *testing.T) {
+	for _, key := range []string{"public", "system"} {
+		doc := &Node{Type: DocumentNode}
+		doc.AppendChild(&Node{
+			Type: DoctypeNode,
+			Data: "html",
+			Attr: []Attribute{{Key: key, Val: `"'><script>alert(1)</script>`}},
+		})
+		if err := Render(new(bytes.Buffer), doc); err == nil {
+			t.Errorf("Render with a %q identifier containing both quote types succeeded, want an error", key)
+		}
+	}
+}
+
 func TestRenderFosteredForeignContent(t *testing.T) {
 	a := `<math><mtext><table><mglyph><style><img src=x onerror=alert(1)>`
 	d, err := Parse(strings.NewReader(a))
